@@ -1,0 +1,446 @@
+---
+title: "VCF Quality Control & Relatedness Tutorial"
+subtitle: "SNP-based QC, diversity, relatedness, and breeding-group selection"
+author: "Your Name"
+date: today
+format:
+  html:
+    code-fold: show
+    fig-width: 8
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This tutorial walks through a typical population-genomics QC and relatedness
+workflow starting from a VCF file:
+
+1. Package setup
+2. General SNP-level quality control (QUAL, depth, missingness)
+3. Basic diversity statistics (Ho, He, Fis)
+4. Individual heterozygosity and inbreeding
+5. Pairwise relatedness and kinship
+6. Network visualization of relatedness
+7. Selecting low-relatedness breeding groups with `swingeR`
+
+Adjust the file paths in @sec-setup to point at your own VCF and metadata
+files before rendering.
+
+## Setup {#sec-setup}
+
+### Install and load packages
+
+```{r}
+#| label: packages
+#| eval: false
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+pkgs <- c("vcfR", "ggplot2", "dplyr", "tidyr", "patchwork", "reshape2",
+          "tidyverse", "vegan", "dartR.base", "dartR.popgen", "adegenet",
+          "SNPRelate", "gdsfmt", "hierfstat", "visNetwork")
+
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    if (p %in% c("vcfR", "SNPRelate", "gdsfmt")) {
+      BiocManager::install(p)
+    } else {
+      install.packages(p)
+    }
+  }
+}
+
+# swingeR: install from the local .tar.gz (see the swingeR package repo/README)
+install.packages("swingeR_0.2.0.tar.gz", repos = NULL, type = "source")
+```
+
+```{r}
+#| label: library-load
+
+library(swingeR)
+library(vcfR)
+library(ggplot2)
+library(dplyr)
+library(dartR.base)
+library(dartR.popgen)
+library(tidyverse)
+library(vegan)
+library(tidyr)
+library(patchwork)
+library(reshape2)
+library(SNPRelate)
+library(hierfstat)
+library(visNetwork)
+```
+
+### File paths
+
+Set these once, and every chunk below will use them.
+
+```{r}
+#| label: paths
+
+vcffile  <- "SPBRsimulated.vcf.gz"
+gdsfile  <- "simulated.gds"
+metafile <- "SPBRmeta.txt"
+```
+
+### Load the VCF and metadata
+
+```{r}
+#| label: load-data
+
+vcf  <- read.vcfR(vcffile)
+meta <- read.table(metafile, header = TRUE, sep = "\t")
+```
+
+## General QC checks
+
+### QUAL score distribution
+
+```{r}
+#| label: qual-dist
+
+ourSNPs <- vcf2df(vcf)
+
+qd_df <- data.frame(QD = ourSNPs$QUAL_num[is.finite(ourSNPs$QUAL_num)])
+
+ggplot(qd_df, aes(x = QD)) +
+  geom_histogram(bins = 100, fill = "#8172B2", colour = "white") +
+  xlim(0, 5000) +
+  labs(x = "QUAL", y = "Count") +
+  theme_bw(base_size = 12)
+```
+
+Quality scaled by depth of coverage (QUAL / DP) is often a more informative
+filter than raw QUAL alone:
+
+```{r}
+#| label: qual-per-dp
+
+ourSNPs$QUAL_per_dp <- ourSNPs$QUAL_num / ourSNPs$DP_raw
+
+qd_df <- data.frame(QD = ourSNPs$QUAL_per_dp[is.finite(ourSNPs$QUAL_per_dp)])
+
+ggplot(qd_df, aes(x = QD)) +
+  geom_histogram(bins = 100, fill = "#8172B2", colour = "white") +
+  geom_vline(xintercept = 0.2, linetype = "dashed", colour = "red") +
+  xlim(0, 3) +
+  labs(x = "QUAL / DP (quality / depth of coverage)", y = "Count") +
+  theme_bw(base_size = 12)
+```
+
+### Read depth (DP) distribution
+
+```{r}
+#| label: dp-dist
+
+dp_df <- data.frame(DP = ourSNPs$DP_raw)
+
+ggplot(dp_df, aes(x = DP)) +
+  geom_histogram(bins = 100, fill = "#8172B2", colour = "white") +
+  labs(title = "Read Depth (DP) Distribution", x = "Depth", y = "Count") +
+  theme_bw(base_size = 13)
+```
+
+Depth per genotype, trimmed to the 99th percentile, with mean +/- 3 SD
+thresholds marked:
+
+```{r}
+#| label: dp-per-genotype
+
+dp_per_genotype <- ourSNPs$DP_raw / ourSNPs$n_genotypes
+dp_df <- data.frame(DP = dp_per_genotype)
+dp_df <- dp_df[!is.na(dp_df$DP) & dp_df$DP < quantile(dp_df$DP, 0.99, na.rm = TRUE), ,
+               drop = FALSE]
+
+dp_mean    <- mean(dp_df$DP, na.rm = TRUE)
+dp_mean2sd <- dp_mean + 3 * sd(dp_df$DP, na.rm = TRUE)
+
+ggplot(dp_df, aes(x = DP)) +
+  geom_histogram(bins = 100, fill = "#8172B2", colour = "white") +
+  geom_vline(xintercept = c(6, dp_mean, 85), linetype = "dashed",
+             colour = c("red", "orange", "red")) +
+  labs(title = "Read Depth (DP) Distribution", x = "Depth", y = "Count") +
+  theme_bw(base_size = 13)
+```
+
+### Missing data
+
+Per sample:
+
+```{r}
+#| label: missing-per-sample
+
+ourInd <- vcf2inddf(vcf)
+
+miss_df <- data.frame(Sample = ourInd$ID, Missing_pct = ourInd$miss_pct)
+
+ggplot(miss_df, aes(x = reorder(Sample, -Missing_pct), y = Missing_pct)) +
+  geom_col(fill = "#8172B2") +
+  geom_hline(yintercept = 20, linetype = "dashed", colour = "red") +
+  labs(title = "Missing Genotypes per Sample", x = "Sample", y = "Missing (%)") +
+  theme_bw(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+Per locus:
+
+```{r}
+#| label: missing-per-locus
+
+miss_var_df <- data.frame(Miss_pct = ourSNPs$missing)
+
+ggplot(miss_var_df, aes(x = Miss_pct)) +
+  geom_histogram(bins = 50, fill = "#CCB974", colour = "white") +
+  geom_vline(xintercept = 20, linetype = "dashed", colour = "red") +
+  labs(title = "Missing Data per Variant", x = "Missing Genotypes (%)",
+       y = "Number of Variants") +
+  theme_bw(base_size = 13)
+```
+
+### Per-chromosome variant count
+
+```{r}
+#| label: per-chrom
+
+chr_df <- ourSNPs %>%
+  count(CHROM) %>%
+  arrange(as.numeric(gsub("scaffold_", "", CHROM))) %>%
+  mutate(CHROM = factor(CHROM, levels = CHROM))
+
+ggplot(chr_df, aes(x = CHROM, y = n, fill = CHROM)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Variants per Chromosome", x = "Chromosome", y = "Count") +
+  theme_bw(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Basic diversity statistics
+
+```{r}
+#| label: basic-diversity
+
+gi <- vcfR2genind(vcf)
+pop(gi) <- as.factor(rep("pop1", nInd(gi)))
+
+stats <- basic.stats(gi)
+stats$overall[c("Ho", "Hs", "Fis")]
+```
+
+### Per-locus heterozygosity and Fis
+
+```{r}
+#| label: perloc-ho
+
+ggplot(stats$perloc, aes(x = Ho)) +
+  geom_histogram(bins = 20, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = 0.75, linetype = "dashed", colour = "red") +
+  labs(title = "Observed heterozygosity per locus", x = "Ho",
+       y = "Number of Variants") +
+  theme_bw(base_size = 13)
+```
+
+```{r}
+#| label: perloc-he
+
+ggplot(stats$perloc, aes(x = Hs)) +
+  geom_histogram(bins = 20, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = 0.75, linetype = "dashed", colour = "red") +
+  labs(title = "Expected heterozygosity per locus", x = "He",
+       y = "Number of Variants") +
+  theme_bw(base_size = 13)
+```
+
+```{r}
+#| label: perloc-fis
+
+ggplot(stats$perloc, aes(x = Fis)) +
+  geom_histogram(bins = 20, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "red") +
+  labs(title = "Inbreeding index per locus (Fis)", x = "Fis",
+       y = "Number of Variants") +
+  theme_bw(base_size = 13)
+```
+
+## Individual heterozygosity
+
+```{r}
+#| label: ind-het
+
+df_ihe <- ourInd[order(ourInd$Ho), ]
+df_ihe$ID <- factor(df_ihe$ID, levels = df_ihe$ID)
+
+mean_ho <- mean(df_ihe$Ho, na.rm = TRUE)
+
+ggplot(df_ihe, aes(x = ID, y = Ho)) +
+  geom_col(fill = "steelblue", colour = "white") +
+  geom_hline(yintercept = mean_ho, colour = "tomato", linetype = "dashed",
+             linewidth = 0.8) +
+  annotate("text", x = nrow(df_ihe), y = mean_ho * 1.05,
+           label = paste("Mean =", round(mean_ho, 3)),
+           colour = "tomato", hjust = 1, size = 3.5) +
+  labs(title = "Observed heterozygosity per individual", x = "Sample",
+       y = "Ho (proportion of heterozygous loci)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+## Individual inbreeding coefficient (GDS/SNPRelate)
+
+```{r}
+#| label: vcf2gds
+
+showfile.gds(closeall = TRUE)
+genofile <- vcf2gds(vcffile, gdsfile)
+snpgdsSummary(gdsfile)
+```
+
+```{r}
+#| label: filter-chroms
+
+snp_id <- read.gdsn(index.gdsn(genofile, "snp.id"))
+chrom  <- read.gdsn(index.gdsn(genofile, "snp.chromosome"))
+chrom_keep <- paste0("scaffold_", 1:24)
+snps_chrom <- snp_id[chrom %in% chrom_keep]
+cat("SNPs on first 24 scaffolds/chromosomes:", length(snps_chrom), "\n")
+```
+
+```{r}
+#| label: individual-F
+
+ibd <- snpgdsIndInb(genofile, snp.id = snps_chrom, autosome.only = FALSE)
+ibd_df <- data.frame(ID = ibd$sample.id, F = ibd$inbreeding)
+ibd_df <- ibd_df[order(ibd_df$F), ]
+
+ggplot(ibd_df, aes(x = reorder(ID, F), y = F)) +
+  geom_col(fill = "steelblue", colour = "white") +
+  geom_hline(yintercept = 0, colour = "tomato", linetype = "dashed") +
+  labs(title = "Individual inbreeding coefficient (F)", x = "Sample", y = "F") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+## Pairwise relatedness and kinship
+
+Beta-based relatedness:
+
+```{r}
+#| label: relatedness-beta
+
+relBet <- snpgdsIndivBeta(genofile, snp.id = snp_id, autosome.only = FALSE)
+rel_matrix <- relBet$beta
+rownames(rel_matrix) <- relBet$sample.id
+colnames(rel_matrix) <- relBet$sample.id
+
+rel_df <- as.data.frame(as.table(rel_matrix))
+colnames(rel_df) <- c("from", "to", "kinship")
+rel_df <- rel_df %>% filter(as.character(from) != as.character(to))
+```
+
+KING-robust kinship:
+
+```{r}
+#| label: relatedness-king
+
+king <- snpgdsIBDKING(genofile, snp.id = snps_chrom, type = "KING-robust",
+                       autosome.only = FALSE, verbose = TRUE)
+kinship_matrix <- king$kinship
+rownames(kinship_matrix) <- king$sample.id
+colnames(kinship_matrix) <- king$sample.id
+
+kinship_df <- as.data.frame(as.table(kinship_matrix))
+colnames(kinship_df) <- c("from", "to", "kinship")
+kinship_df <- kinship_df %>% filter(as.character(from) != as.character(to))
+
+cat("Number of pairwise comparisons:", nrow(kinship_df), "\n")
+summary(kinship_df$kinship)
+```
+
+### Visualizing the kinship distribution
+
+```{r}
+#| label: kinship-plot
+
+kinship_labels <- data.frame(
+  x = c(0, 0.125, 0.25, 0.5),
+  label = c("Unrelated", "3rd degree", "2nd degree", "1st degree")
+)
+
+ggplot(kinship_df, aes(x = kinship)) +
+  geom_histogram(bins = 100, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = kinship_labels$x, linetype = "dashed",
+             colour = "red", linewidth = 0.8) +
+  geom_text(data = kinship_labels, aes(x = x, y = Inf, label = label),
+            inherit.aes = FALSE, colour = "tomato", hjust = 1.2, vjust = 1.5,
+            angle = 90, size = 4) +
+  labs(title = "Pairwise Kinship", x = "Kinship", y = "Frequency") +
+  theme_bw(base_size = 13)
+```
+
+## Network visualization of relatedness
+
+```{r}
+#| label: network
+
+net <- networkY(kinship_df, meta, td = 0.1, method = "fixed")
+net
+```
+
+```{r}
+#| label: network-save
+#| eval: false
+
+visSave(net, "relatedness_network.html")
+```
+
+## Selecting low-relatedness breeding groups
+
+Combine metadata with the individual inbreeding estimates, then hand the
+kinship data frame and combined metadata to `swingeR()` from
+the `swingeR` package.
+
+```{r}
+#| label: combine-metadata
+
+combined_df <- merge(meta, ibd_df, by = "ID")
+combined_df
+```
+
+```{r}
+#| label: breeding-groups
+
+results <- swingeR(
+  kinship_df = kinship_df,
+  info_df    = combined_df,
+  n_groups   = 2,
+  n_females  = 2,
+  n_males    = 3
+)
+print_breeding_groups(results)
+```
+
+With tighter thresholds:
+
+```{r}
+#| label: breeding-groups-strict
+
+results_strict <- swingeR(
+  kinship_df = kinship_df,
+  info_df    = combined_df,
+  n_groups   = 2,
+  n_females  = 2,
+  n_males    = 3,
+  max_ir_f   = 0.0,
+  max_ir_m   = 0.0,
+  max_pair_rel_f    = -0.01,
+  max_pair_rel_m    = -0.01,
+  max_group_avg_rel = -0.02
+)
+print_breeding_groups(results_strict)
+```
