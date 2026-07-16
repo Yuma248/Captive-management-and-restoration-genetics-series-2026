@@ -3,7 +3,7 @@ project:
   output-dir: docs
 
 website:
-  title: "VCF QC & Relatedness Tutorial"
+  title: "BIOL3722_2026"
   navbar:
     left:
       - href: index.qmd
@@ -17,3 +17,7 @@ format:
     code-fold: show
     code-tools: true
     number-sections: true
+
+params:
+  session: 1
+  
