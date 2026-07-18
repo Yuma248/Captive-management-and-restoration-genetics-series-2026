@@ -20,11 +20,10 @@ Captive-management-and-restoration-genetics-series-2026/
 
 ## Data files
 
-ddRAD data for the SPP breeding program in VCF format.
+ddRAD data for the SPP breeding program in VCF format, and metadata including sex information for each sample. All in the folder data/
 
-##SwingeR package 
-To install, in R run the following commnads:
-
+##SwingeR package
+To install swingeR, in R run the following commands:
 
 ``` {r}
 install.packages("remotes")
